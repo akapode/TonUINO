@@ -20,6 +20,18 @@
 // uncomment the below line to enable five button support
 //#define FIVEBUTTONS
 
+// uncomment the below line to enable potentiometer for volume control
+#define VOLUMEPOTENTIOMETER
+
+// uncomment the below line to enable hoerspielwahl by button press for some time
+#define HOERSPIELWAHL_PLUS
+
+// uncomment the below line to enable headphone detection
+#define KOPFHOERER
+
+// uncomment the below line to flip the shutdown pin logic
+// #define POLOLUSWITCH
+
 static const uint32_t cardCookie = 322417479;
 
 // DFPlayer Mini
@@ -29,6 +41,14 @@ uint16_t currentTrack;
 uint16_t firstTrack;
 uint8_t queue[255];
 uint8_t volume;
+
+#ifdef VOLUMEPOTENTIOMETER
+uint8_t lastvolume = 99;
+#endif
+
+#ifdef HOERSPIELWAHL_PLUS
+bool ignoreButtons = true;
+#endif
 
 struct folderSettings {
   uint8_t folder;
@@ -68,6 +88,15 @@ adminSettings mySettings;
 nfcTagObject myCard;
 folderSettings *myFolder;
 unsigned long sleepAtMillis = 0;
+
+#ifdef HOERSPIELWAHL_PLUS
+unsigned long ignorePressAtMillis = 0;
+#endif
+
+#ifdef KOPFHOERER
+   uint8_t maxVolumeSpeaker;
+#endif   
+
 static uint16_t _lastTrackFinished;
 
 static void nextTrack(uint16_t track);
@@ -101,6 +130,9 @@ class Mp3Notify {
       //      Serial.print("Track beendet");
       //      Serial.println(track);
       //      delay(100);
+#ifdef HOERSPIELAUSWAHL_PLUS
+      disableButtonTimer();
+#endif
       nextTrack(track);
     }
     static void OnPlaySourceOnline(DfMp3_PlaySources source) {
@@ -148,17 +180,17 @@ void resetSettings() {
   mySettings.cookie = cardCookie;
   mySettings.version = 2;
   mySettings.maxVolume = 25;
-  mySettings.minVolume = 5;
+  mySettings.minVolume = 1;
   mySettings.initVolume = 15;
   mySettings.eq = 1;
   mySettings.locked = false;
-  mySettings.standbyTimer = 0;
-  mySettings.invertVolumeButtons = true;
+  mySettings.standbyTimer = 5;
+  mySettings.invertVolumeButtons = false;
   mySettings.shortCuts[0].folder = 0;
   mySettings.shortCuts[1].folder = 0;
   mySettings.shortCuts[2].folder = 0;
   mySettings.shortCuts[3].folder = 0;
-  mySettings.adminMenuLocked = 0;
+  mySettings.adminMenuLocked = 3;
   mySettings.adminMenuPin[0] = 1;
   mySettings.adminMenuPin[1] = 1;
   mySettings.adminMenuPin[2] = 1;
@@ -195,6 +227,10 @@ void loadSettingsFromFlash() {
   Serial.print(F("Maximal Volume: "));
   Serial.println(mySettings.maxVolume);
 
+#ifdef KOPFHOERER
+   maxVolumeSpeaker=mySettings.maxVolume;
+#endif   
+   
   Serial.print(F("Minimal Volume: "));
   Serial.println(mySettings.minVolume);
 
@@ -643,7 +679,15 @@ MFRC522::StatusCode status;
 #define buttonDown A2
 #define busyPin 4
 #define shutdownPin 7
-#define openAnalogPin A7
+#define openAnalogPin A6
+
+#ifdef VOLUMEPOTENTIOMETER
+#define volumeADC A7
+#endif
+
+#ifdef KOPFHOERER
+#define headphonesPin 8
+#endif
 
 #ifdef FIVEBUTTONS
 #define buttonFourPin A3
@@ -667,6 +711,29 @@ bool ignoreButtonFour = false;
 bool ignoreButtonFive = false;
 #endif
 
+#ifdef HOERSPIELWAHL_PLUS
+/// Timer zum deaktivieren der Tasten
+void setButtonTimer() {
+      ignorePressAtMillis = millis() + (20 * 1000);
+      Serial.println(F("=== setButtonTimer"));
+      Serial.println(ignorePressAtMillis);
+}
+
+void checkIgnorePressAtMillis() {
+  //Serial.println(F("check"));
+  if (ignorePressAtMillis != 0 && millis() > ignorePressAtMillis) {
+        ignoreButtons=true;
+  } else {
+        ignoreButtons=false;
+  //Serial.println(F("läuft"));
+  }
+}
+
+void disableButtonTimer() {
+  ignorePressAtMillis = 0;
+}
+#endif
+
 /// Funktionen für den Standby Timer (z.B. über Pololu-Switch oder Mosfet)
 
 void setstandbyTimer() {
@@ -687,7 +754,11 @@ void checkStandbyAtMillis() {
   if (sleepAtMillis != 0 && millis() > sleepAtMillis) {
     Serial.println(F("=== power off!"));
     // enter sleep state
+#if defined POLOLUSWITCH
     digitalWrite(shutdownPin, HIGH);
+#else
+    digitalWrite(shutdownPin, LOW);
+#endif
     delay(500);
 
     // http://discourse.voss.earth/t/intenso-s10000-powerbank-automatische-abschaltung-software-only/805
@@ -753,8 +824,21 @@ void setup() {
   mp3.begin();
   // Zwei Sekunden warten bis der DFPlayer Mini initialisiert ist
   delay(2000);
+  
+#ifdef VOLUMEPOTENTIOMETER
+  pinMode(volumeADC, INPUT); 
+  CheckVolume();
+#endif
+#ifndef VOLUMEPOTENTIOMETER
   volume = mySettings.initVolume;
   mp3.setVolume(volume);
+#endif
+  
+#ifdef KOPFHOERER
+   pinMode(headphonesPin, INPUT);
+   CheckHeadphones();   
+#endif
+  
   mp3.setEq(mySettings.eq - 1);
   // Fix für das Problem mit dem Timeout (ist jetzt in Upstream daher nicht mehr nötig!)
   //mySoftwareSerial.setTimeout(10000);
@@ -776,7 +860,11 @@ void setup() {
   pinMode(buttonFivePin, INPUT_PULLUP);
 #endif
   pinMode(shutdownPin, OUTPUT);
+#if defined POLOLUSWITCH
   digitalWrite(shutdownPin, LOW);
+#else
+  digitalWrite(shutdownPin, HIGH);
+#endif
 
 
   // RESET --- ALLE DREI KNÖPFE BEIM STARTEN GEDRÜCKT HALTEN -> alle EINSTELLUNGEN werden gelöscht
@@ -804,7 +892,43 @@ void readButtons() {
 #endif
 }
 
+#ifdef VOLUMEPOTENTIOMETER
+void CheckVolume() {
+  if (activeModifier != NULL) {
+    if (activeModifier->handleVolumeUp() == true) return;
+    if (activeModifier->handleVolumeDown() == true) return;    
+  }
+
+  volume = map( analogRead(volumeADC), 0, 1023, mySettings.minVolume, mySettings.maxVolume);
+  if( abs(volume-lastvolume) >1){
+    mp3.setVolume( volume );
+    lastvolume= volume;
+    Serial.println(F(" = Volume"));
+    Serial.println( volume );
+  }
+}
+#endif
+
+#ifdef KOPFHOERER
+void CheckHeadphones() {
+  if (digitalRead(headphonesPin)) {
+    mySettings.maxVolume=15;
+    //Serial.println(F(" = HeadphonesVolume"));
+    //Serial.println( mySettings.maxVolume );
+  } else {
+    mySettings.maxVolume=maxVolumeSpeaker;
+    //Serial.println(F(" = SpeakerVolume"));
+    //Serial.println( mySettings.maxVolume );
+  }
+  //CheckVolume(); //wird schon in der Loop gemacht (bei Poti)
+}
+#endif
+
 void volumeUpButton() {
+#ifdef VOLUMEPOTENTIOMETER
+   nextButton();
+#endif
+#ifndef VOLUMEPOTENTIOMETER
   if (activeModifier != NULL)
     if (activeModifier->handleVolumeUp() == true)
       return;
@@ -815,9 +939,14 @@ void volumeUpButton() {
     volume++;
   }
   Serial.println(volume);
+#endif
 }
 
 void volumeDownButton() {
+#ifdef VOLUMEPOTENTIOMETER
+   previousButton();
+#endif
+#ifndef VOLUMEPOTENTIOMETER
   if (activeModifier != NULL)
     if (activeModifier->handleVolumeDown() == true)
       return;
@@ -828,13 +957,23 @@ void volumeDownButton() {
     volume--;
   }
   Serial.println(volume);
+#endif
 }
 
 void nextButton() {
   if (activeModifier != NULL)
     if (activeModifier->handleNextButton() == true)
       return;
-
+#ifdef HOERSPIELWAHL_PLUS
+    if (myFolder->mode == 1) {
+    if (currentTrack != numTracksInFolder && ignoreButtons == false) {
+      currentTrack = currentTrack + 1;
+      mp3.playFolderTrack(myFolder->folder, currentTrack);
+      setButtonTimer();
+    }
+  return;    
+  }
+#endif
   nextTrack(random(65536));
   delay(1000);
 }
@@ -843,7 +982,15 @@ void previousButton() {
   if (activeModifier != NULL)
     if (activeModifier->handlePreviousButton() == true)
       return;
-
+#ifdef HOERSPIELWAHL_PLUS
+  if (myFolder->mode == 1) {
+    if (currentTrack != firstTrack && ignoreButtons == false) {
+      currentTrack = currentTrack - 1;
+      mp3.playFolderTrack(myFolder->folder, currentTrack);
+      setButtonTimer();
+    }
+  }
+#endif   
   previousTrack();
   delay(1000);
 }
@@ -863,6 +1010,9 @@ void playFolder() {
   if (myFolder->mode == 1) {
     Serial.println(F("Hörspielmodus -> zufälligen Track wiedergeben"));
     currentTrack = random(1, numTracksInFolder + 1);
+#ifdef HOERSPIELWAHL_PLUS
+    setButtonTimer();
+#endif
     Serial.println(currentTrack);
     mp3.playFolderTrack(myFolder->folder, currentTrack);
   }
@@ -958,6 +1108,15 @@ void loop() {
     // Buttons werden nun über JS_Button gehandelt, dadurch kann jede Taste
     // doppelt belegt werden
     readButtons();
+#ifdef KOPFHOERER     
+    CheckHeadphones();
+#endif        
+#ifdef VOLUMEPOTENTIOMETER
+    CheckVolume();
+#endif
+#ifdef HOERSPIELWAHL_PLUS
+    checkIgnorePressAtMillis();
+#endif
 
     // admin menu
     if ((pauseButton.pressedFor(LONG_PRESS) || upButton.pressedFor(LONG_PRESS) || downButton.pressedFor(LONG_PRESS)) && pauseButton.isPressed() && upButton.isPressed() && downButton.isPressed()) {
